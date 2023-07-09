@@ -8,9 +8,13 @@
 #include <sstream>
 #include <fstream>
 #include <map>
+#include <fcntl.h> // Added include statement for file access flags
 
 // Environment variables
 std::map<std::string, std::string> environmentVariables;
+
+
+
 
 /**
  * Splits a string into tokens based on a delimiter.
@@ -32,8 +36,30 @@ std::vector<std::string> Split(const std::string& str, char delimiter) {
  * Executes the child process.
  * @param command The command to execute.
  * @param argv The arguments for the command.
+ * @param inputFile The input file for redirection (STDIN).
+ * @param outputFile The output file for redirection (STDOUT).
  */
-void ExecuteChildProcess(const std::string& command, char** argv) {
+void ExecuteChildProcess(const std::string& command, char** argv, const std::string& inputFile, const std::string& outputFile) {
+    if (!inputFile.empty()) {
+        int inputFileDescriptor = open(inputFile.c_str(), O_RDONLY);
+        if (inputFileDescriptor == -1) {
+            std::cerr << "Failed to open input file: " << inputFile << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        dup2(inputFileDescriptor, STDIN_FILENO);
+        close(inputFileDescriptor);
+    }
+
+    if (!outputFile.empty()) {
+        int outputFileDescriptor = open(outputFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (outputFileDescriptor == -1) {
+            std::cerr << "Failed to open output file: " << outputFile << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        dup2(outputFileDescriptor, STDOUT_FILENO);
+        close(outputFileDescriptor);
+    }
+
     execvp(command.c_str(), argv);
     std::cerr << "Failed to execute command: " << command << std::endl;
     exit(EXIT_FAILURE);
@@ -56,8 +82,10 @@ void ExecuteParentProcess(pid_t pid, bool runInBackground) {
  * @param command The command to execute.
  * @param args The arguments for the command.
  * @param runInBackground Flag indicating whether the command should run in the background.
+ * @param inputFile The input file for redirection (STDIN).
+ * @param outputFile The output file for redirection (STDOUT).
  */
-void ExecuteCommand(const std::string& command, const std::vector<std::string>& args, bool runInBackground) {
+void ExecuteCommand(const std::string& command, const std::vector<std::string>& args, bool runInBackground, const std::string& inputFile, const std::string& outputFile) {
     pid_t pid = fork();
     if (pid < 0) {
         std::cerr << "Failed to create child process." << std::endl;
@@ -70,7 +98,8 @@ void ExecuteCommand(const std::string& command, const std::vector<std::string>& 
             argv[i + 1] = const_cast<char*>(args[i].c_str());
         }
         argv[args.size() + 1] = nullptr;
-        ExecuteChildProcess(command, argv.data());
+
+        ExecuteChildProcess(command, argv.data(), inputFile, outputFile);
     } else {
         // Parent process
         ExecuteParentProcess(pid, runInBackground);
@@ -78,166 +107,79 @@ void ExecuteCommand(const std::string& command, const std::vector<std::string>& 
 }
 
 /**
- * Checks if the command is a background command.
- * @param args The command arguments.
- * @return True if the command is a background command, false otherwise.
+ * Executes a command line.
+ * @param commandLine The command line to execute.
  */
-bool IsBackgroundCommand(const std::vector<std::string>& args) {
-    return !args.empty() && args.back() == "&";
-}
+void ExecuteCommandLine(const std::string& commandLine) {
+    std::vector<std::string> commands = Split(commandLine, '|');
+    int numCommands = static_cast<int>(commands.size());
+    int pipefds[numCommands - 1][2];
 
-/**
- * Removes the background symbol from the command arguments.
- * @param args The command arguments.
- */
-void RemoveBackgroundSymbol(std::vector<std::string>& args) {
-    if (!args.empty() && args.back() == "&") {
-        args.pop_back();
-    }
-}
+    for (int i = 0; i < numCommands; ++i) {
+        std::string command = commands[i];
+        std::vector<std::string> args = Split(command, ' ');
 
-/**
- * Prints the list of background jobs.
- * @param backgroundProcesses The list of background process IDs.
- */
-void PrintBackgroundJobs(const std::vector<pid_t>& backgroundProcesses) {
-    for (pid_t pid : backgroundProcesses) {
-        std::string cmdLine;
-        std::ifstream cmdLineFile("/proc/" + std::to_string(pid) + "/comm");
-        std::getline(cmdLineFile, cmdLine);
-        cmdLineFile.close();
-        std::cout << "PID: " << pid << "  Command: " << cmdLine << std::endl;
-    }
-}
+        // Check for input/output redirection
+        std::string inputFile;
+        std::string outputFile;
+        bool runInBackground = false;
 
-/**
- * Sets an environment variable.
- * @param args The command arguments.
- */
-void SetEnvironmentVariable(const std::vector<std::string>& args) {
-    if (args.size() == 2) {
-        environmentVariables[args[0]] = args[1];
-    } else {
-        std::cerr << "Invalid arguments for 'set' command." << std::endl;
-    }
-}
-
-/**
- * Unsets an environment variable.
- * @param args The command arguments.
- */
-void UnsetEnvironmentVariable(const std::vector<std::string>& args) {
-    if (args.size() == 1) {
-        environmentVariables.erase(args[0]);
-    } else {
-        std::cerr << "Invalid arguments for 'unset' command." << std::endl;
-    }
-}
-
-/**
- * Expands environment variables in the command arguments.
- * @param args The command arguments.
- */
-void ExpandEnvironmentVariables(std::vector<std::string>& args) {
-    for (std::string& arg : args) {
-        if (arg.empty())
-            continue;
-
-        if (arg[0] != '$' && arg[0] != '{')
-            continue;
-
-        std::string varName = arg.substr(1);
-        if (varName.empty())
-            continue;
-
-        if (varName[0] == '{' && varName.back() == '}') {
-            varName = varName.substr(1, varName.size() - 2);
+        // Input redirection ("<" operator)
+        auto inputFilePos = std::find(args.begin(), args.end(), "<");
+        if (inputFilePos != args.end() && inputFilePos + 1 != args.end()) {
+            inputFile = *(inputFilePos + 1);
+            args.erase(inputFilePos, inputFilePos + 2);
         }
 
-        auto it = environmentVariables.find(varName);
-        if (it != environmentVariables.end()) {
-            arg = it->second;
-        } else {
-            std::cerr << "Environment variable not found: " << varName << std::endl;
+        // Output redirection (">" operator)
+        auto outputFilePos = std::find(args.begin(), args.end(), ">");
+        if (outputFilePos != args.end() && outputFilePos + 1 != args.end()) {
+            outputFile = *(outputFilePos + 1);
+            args.erase(outputFilePos, outputFilePos + 2);
+        }
+
+        // Background execution ("&" operator)
+        auto backgroundPos = std::find(args.begin(), args.end(), "&");
+        if (backgroundPos != args.end()) {
+            runInBackground = true;
+            args.erase(backgroundPos);
+        }
+
+        if (i < numCommands - 1) {
+            if (pipe(pipefds[i]) == -1) {
+                std::cerr << "Failed to create pipe." << std::endl;
+                return;
+            }
+        }
+
+        ExecuteCommand(args[0], args, runInBackground, inputFile, outputFile);
+
+        if (i < numCommands - 1) {
+            close(pipefds[i][1]);
+            inputFile = "";
+            inputFile = "pipe";
         }
     }
-}
 
-/**
- * Handles the execution of built-in commands.
- * @param command The command to handle.
- * @param args The command arguments.
- * @param backgroundProcesses The list of background process IDs.
- * @return True if the command is a built-in command and handled successfully, false otherwise.
- */
-bool HandleBuiltInCommands(const std::string& command, const std::vector<std::string>& args, std::vector<pid_t>& backgroundProcesses) {
-    if (command == "myjobs") {
-        PrintBackgroundJobs(backgroundProcesses);
-        return true;
-    } else if (command == "set") {
-        SetEnvironmentVariable(args);
-        return true;
-    } else if (command == "unset") {
-        UnsetEnvironmentVariable(args);
-        return true;
-    }
-    return false;
-}
-
-/**
- * Processes a command line.
- * @param commandLine The command line to process.
- * @param backgroundProcesses The list of background process IDs.
- */
-void ProcessCommandLine(const std::string& commandLine, std::vector<pid_t>& backgroundProcesses) {
-    std::vector<std::string> tokens = Split(commandLine, ' ');
-    if (tokens.empty()) {
-        return;
-    }
-
-    std::string command = tokens[0];
-    std::vector<std::string> args(tokens.begin() + 1, tokens.end());
-
-    bool runInBackground = IsBackgroundCommand(args);
-    if (runInBackground) {
-        RemoveBackgroundSymbol(args);
-    }
-
-    ExpandEnvironmentVariables(args);
-
-    if (HandleBuiltInCommands(command, args, backgroundProcesses)) {
-        return;
-    }
-
-    ExecuteCommand(command, args, runInBackground);
-
-    if (runInBackground) {
-        pid_t pid = fork();
-        if (pid < 0) {
-            std::cerr << "Failed to create child process." << std::endl;
-        } else if (pid > 0) {
-            backgroundProcesses.push_back(pid);
-        } else {
-            return;
-        }
-    }
-}
-
-/**
- * Runs the shell.
- */
-void RunShell() {
-    std::string commandLine;
-    std::vector<pid_t> backgroundProcesses;
-
-    while (true) {
-        std::cout << "shell> ";
-        std::getline(std::cin, commandLine);
-        ProcessCommandLine(commandLine, backgroundProcesses);
+    for (int i = 0; i < numCommands - 1; ++i) {
+        close(pipefds[i][0]);
     }
 }
 
 int main() {
-    RunShell();
-    return EXIT_SUCCESS;
+    std::string commandLine;
+    std::cout << "Shell> ";
+
+    while (getline(std::cin, commandLine)) {
+        if (commandLine.empty())
+            continue;
+        else if (commandLine == "exit")
+            break;
+        else
+            ExecuteCommandLine(commandLine);
+
+        std::cout << "Shell> ";
+    }
+
+    return 0;
 }
